@@ -11,69 +11,96 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "summarize" && info.selectionText) {
     try {
-      // Debug logging
-      console.log("Checking AI availability...");
-      console.log("self.ai:", self.ai);
-      console.log("chrome.ai:", chrome.ai);
-      console.log("globalThis.ai:", globalThis.ai);
-      
-      // Try different ways to access AI
-      const ai = self.ai || chrome.ai || globalThis.ai;
-      
-      if (!ai || !ai.summarizer) {
-        // Log more details for debugging
-        console.error("AI not found. Available APIs:", {
-          self: Object.keys(self).filter(k => k.includes('ai')),
-          chrome: Object.keys(chrome).filter(k => k.includes('ai')),
-          globalThis: Object.keys(globalThis).filter(k => k.includes('ai'))
-        });
-        throw new Error("Chrome AI APIs are not available. Please ensure you're using Chrome 129+ and have enabled AI features.");
+      // Check if Summarizer API is available
+      if (!('Summarizer' in self)) {
+        throw new Error("Summarizer API is not supported. Please use Chrome 138+ with AI features enabled.");
       }
-      
-      const canSummarize = await ai.summarizer.capabilities();
-      let summarizer;
 
-      if (canSummarize && canSummarize.available !== 'no') {
-        if (canSummarize.available === 'readily') {
-          summarizer = await ai.summarizer.create();
-        } else {
-          summarizer = await ai.summarizer.create();
-          summarizer.addEventListener('downloadprogress', (e) => {
-            console.log(`Download progress: ${e.loaded}/${e.total}`);
-          });
-          await summarizer.ready;
+      // Check availability
+      const availability = await Summarizer.availability();
+      if (availability === 'unavailable') {
+        throw new Error("Summarizer API is not available on this device. Please check hardware requirements.");
+      }
+
+      // Show progress only if model needs to be downloaded
+      let showProgress = false;
+      if (availability === 'downloadable' || availability === 'downloading') {
+        showProgress = true;
+        sendMessageToTab(tab.id, {
+          action: "showProgress",
+          progress: 0
+        });
+      } else if (availability === 'available') {
+        // Show brief processing message when model is ready
+        sendMessageToTab(tab.id, {
+          action: "showProcessing"
+        });
+      }
+
+      // Create summarizer with options
+      const summarizer = await Summarizer.create({
+        type: 'key-points',
+        format: 'markdown',
+        length: 'medium',
+        monitor(m) {
+          if (showProgress) {
+            m.addEventListener('downloadprogress', (e) => {
+              console.log(`Download progress: ${e.loaded}/${e.total}`);
+              // Send progress to content script with error handling
+              sendMessageToTab(tab.id, {
+                action: "showProgress",
+                progress: e.loaded / e.total
+              });
+            });
+          }
         }
+      });
 
-        const summary = await summarizer.summarize(info.selectionText);
-        currentSummary = summary;
-        
-        chrome.storage.local.set({ 
-          lastSummary: summary,
-          originalText: info.selectionText 
-        });
+      // Generate summary
+      const summary = await summarizer.summarize(info.selectionText, {
+        context: 'This is text selected by a user from a webpage.'
+      });
 
-        chrome.tabs.sendMessage(tab.id, {
-          action: "showSummary",
-          summary: summary,
-          originalText: info.selectionText
-        });
-        
-        summarizer.destroy();
-      } else {
-        chrome.tabs.sendMessage(tab.id, {
-          action: "showError",
-          error: "AI Summarizer is not available on this device"
-        });
-      }
+      currentSummary = summary;
+      
+      // Store summary locally
+      chrome.storage.local.set({ 
+        lastSummary: summary,
+        originalText: info.selectionText 
+      });
+
+      // Send summary to content script with error handling
+      sendMessageToTab(tab.id, {
+        action: "showSummary",
+        summary: summary,
+        originalText: info.selectionText
+      });
+      
     } catch (error) {
       console.error('Error summarizing:', error);
-      chrome.tabs.sendMessage(tab.id, {
+      sendMessageToTab(tab.id, {
         action: "showError",
         error: error.message
       });
     }
   }
 });
+
+// Helper function to safely send messages to tabs
+async function sendMessageToTab(tabId, message) {
+  try {
+    // Check if the tab still exists
+    const tab = await chrome.tabs.get(tabId);
+    if (tab && tab.status === 'complete') {
+      await chrome.tabs.sendMessage(tabId, message);
+    } else {
+      console.warn('Tab not available for message sending:', tabId);
+    }
+  } catch (error) {
+    console.warn('Failed to send message to tab:', tabId, error.message);
+    // Don't throw the error, just log it
+  }
+}
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "getLastSummary") {
